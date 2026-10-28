@@ -295,6 +295,7 @@ namespace Patches::FormCaching
         inline std::atomic<int> g_crashLogCount{ 0 };
         inline std::atomic<int> g_nullSkipCount{ 0 };
         inline std::atomic<int> g_formIdSkipCount{ 0 };
+        inline std::atomic<int> g_extFormRepairCount{ 0 };
 
         // Classify an x86 instruction at `ip` for VEH skip handling.
         // Returns: 'C' = CMP/TEST, 'F' = CALL indirect, 'O' = other
@@ -615,29 +616,114 @@ namespace Patches::FormCaching
                     }
                 }
 
-                // v1.22.77: Faults in our own DLL — game jumped here via
-                // corrupted sentinel vtable/function pointer, or our hook
-                // received garbage data. Recover by popping return address
+                // v1.23.0: Form-ID-as-pointer repair for faults inside OTHER
+                // modules (SKSE plugin DLLs). Unresolved raw form IDs left in
+                // pointer fields fault identically whether the dereference runs
+                // in SkyrimSE.exe or in a hooked plugin. Observed: a condition
+                // param handed to race-compatibility.dll's converter (hooked via
+                // the 0x141fdba50 table) as rcx=0x0300082E, faulting at
+                // mov rcx,[rcx+0x40] — the exe-image gate above kept CASE 2 from
+                // repairing it, so the fault escaped unhandled. Run the same
+                // register scan here before giving up. Skip execute faults
+                // (rip==targetAddr): patching a data register can't change a
+                // bad fetch target, so the retry would fault forever.
+                if (rip != targetAddr &&
+                    targetAddr >= 0x100 && targetAddr < 0xFF000000ULL) {
+                    DWORD64* extRegs[] = {
+                        &pep->ContextRecord->Rax,
+                        &pep->ContextRecord->Rcx,
+                        &pep->ContextRecord->Rdx,
+                        &pep->ContextRecord->Rbx,
+                        &pep->ContextRecord->Rbp,
+                        &pep->ContextRecord->Rsi,
+                        &pep->ContextRecord->Rdi,
+                        &pep->ContextRecord->R8,
+                        &pep->ContextRecord->R9,
+                        &pep->ContextRecord->R10,
+                        &pep->ContextRecord->R11,
+                        &pep->ContextRecord->R12,
+                        &pep->ContextRecord->R13,
+                        &pep->ContextRecord->R14,
+                        &pep->ContextRecord->R15,
+                    };
+                    for (int i = 0; i < 15; ++i) {
+                        DWORD64 val = *extRegs[i];
+                        if (val < 0x100 || val >= 0xFF000000ULL)
+                            continue;
+                        if (g_zeroPage && val >= g_zeroPageBase && val < g_zeroPageEnd)
+                            continue;
+                        auto diff = static_cast<std::int64_t>(targetAddr) - static_cast<std::int64_t>(val);
+                        if (diff < -0x1000 || diff > 0x1000)
+                            continue;
+
+                        auto formId = static_cast<RE::FormID>(val);
+                        auto* resolved = TESForm_GetFormByNumericId(formId);
+                        auto repCnt = g_extFormRepairCount.fetch_add(1, std::memory_order_relaxed);
+
+                        if (resolved) {
+                            *extRegs[i] = reinterpret_cast<DWORD64>(resolved);
+                            if (repCnt < 50) {
+                                VehLog("EXT-FORM-RESOLVE #%d: RIP=0x%llX reg=0x%llX formID=0x%08X -> 0x%llX\n",
+                                    repCnt + 1, (unsigned long long)rip,
+                                    (unsigned long long)val, formId,
+                                    reinterpret_cast<unsigned long long>(resolved));
+                            }
+                            return EXCEPTION_CONTINUE_EXECUTION;
+                        }
+                        if (g_zeroPage) {
+                            *extRegs[i] = g_zeroPageBase;
+                            RepairSentinel();
+                            if (repCnt < 50) {
+                                VehLog("EXT-FORM-ZEROPAGE #%d: RIP=0x%llX reg=0x%llX formID=0x%08X NOT FOUND -> zeroPage\n",
+                                    repCnt + 1, (unsigned long long)rip,
+                                    (unsigned long long)val, formId);
+                            }
+                            return EXCEPTION_CONTINUE_EXECUTION;
+                        }
+                        break;
+                    }
+                }
+
+                // v1.22.77: Faults in our own DLL — game called/jumped here
+                // via corrupted sentinel vtable/function pointer, or our hook
+                // received garbage data. Recover by popping a return address
                 // (like a failed CALL) and returning 0 to caller.
+                // v1.23.0: The pop is only valid when [RSP] is actually a
+                // return address — i.e., executable code. A fault inside a
+                // prologue or reached by JUMP (not CALL) leaves data on TOS;
+                // the old blind pop then resumed at stack garbage (observed:
+                // RIP=0x6FFFFC5DC251 trampoline fault → resume at 0x500152A,
+                // a raw XLKR form ID → execute AV). Non-executable TOS now
+                // falls through to the EXT-CRASH log instead.
                 if (g_dllBase && rip >= g_dllBase && rip < g_dllEnd) {
                     auto* rspPtr = reinterpret_cast<DWORD64*>(pep->ContextRecord->Rsp);
                     if (IsReadableMemory(rspPtr, 8)) {
                         DWORD64 retAddr = *rspPtr;
-                        pep->ContextRecord->Rip = retAddr;
-                        pep->ContextRecord->Rsp += 8;
-                        pep->ContextRecord->Rax = 0;
-                        RepairSentinel();
+                        if (IsExecutableMemory(reinterpret_cast<void*>(retAddr))) {
+                            pep->ContextRecord->Rip = retAddr;
+                            pep->ContextRecord->Rsp += 8;
+                            pep->ContextRecord->Rax = 0;
+                            RepairSentinel();
 
-                        static std::atomic<int> s_dllFaultCount{ 0 };
-                        auto cnt = s_dllFaultCount.fetch_add(1, std::memory_order_relaxed);
-                        if (cnt < 50) {
-                            VehLog("DLL-FAULT-RECOVER #%d: RIP=0x%llX target=0x%llX RAX=0x%llX → returning to 0x%llX\n",
-                                cnt + 1, rip,
+                            static std::atomic<int> s_dllFaultCount{ 0 };
+                            auto cnt = s_dllFaultCount.fetch_add(1, std::memory_order_relaxed);
+                            if (cnt < 50) {
+                                VehLog("DLL-FAULT-RECOVER #%d: RIP=0x%llX target=0x%llX RAX=0x%llX → returning to 0x%llX\n",
+                                    cnt + 1, rip,
+                                    (unsigned long long)targetAddr,
+                                    (unsigned long long)pep->ContextRecord->Rax,
+                                    (unsigned long long)retAddr);
+                            }
+                            return EXCEPTION_CONTINUE_EXECUTION;
+                        }
+                        static std::atomic<int> s_dllFaultSupp{ 0 };
+                        auto supp = s_dllFaultSupp.fetch_add(1, std::memory_order_relaxed);
+                        if (supp < 50) {
+                            VehLog("DLL-FAULT-RECOVER suppressed #%d: RIP=0x%llX target=0x%llX TOS=0x%llX not executable — refusing blind pop\n",
+                                supp + 1, rip,
                                 (unsigned long long)targetAddr,
-                                (unsigned long long)pep->ContextRecord->Rax,
                                 (unsigned long long)retAddr);
                         }
-                        return EXCEPTION_CONTINUE_EXECUTION;
                     }
                 }
 

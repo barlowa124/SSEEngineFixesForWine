@@ -412,6 +412,19 @@ namespace Patches::FormCaching
             return queryEnd <= regionEnd;
         }
 
+        // v1.23.0: Executability check for validating candidate code pointers
+        // (e.g., a would-be return address on the stack). Any module's image
+        // or a code cave counts; stack/heap data does not.
+        inline bool IsExecutableMemory(const void* ptr)
+        {
+            MEMORY_BASIC_INFORMATION mbi;
+            if (!VirtualQuery(ptr, &mbi, sizeof(mbi))) return false;
+            if (mbi.State != MEM_COMMIT) return false;
+            constexpr DWORD exec = PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+            return (mbi.Protect & exec) != 0;
+        }
+
         // v1.22.10: Enhanced ClearData diagnostic — dumps files list state
         // when ClearData fires, to see what the engine knew about before compile
         inline void DumpFilesListState(RE::TESDataHandler* a_self, const char* context)

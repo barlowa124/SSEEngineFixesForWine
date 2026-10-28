@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 set(NAME "SSEEngineFixesForWine" CACHE STRING "")
-set(VERSION 1.22.99 CACHE STRING "")
+set(VERSION 1.23.0 CACHE STRING "")
 
 # ---- Options ----
 option(COPY_BUILD "Copy the build output to the Skyrim directory." TRUE)
@@ -156,9 +156,9 @@ add_library(
 )
 
 # Output DLL with "0_" prefix so it loads BEFORE all letter-named SKSE plugins.
-# SKSE enumerates *.dll in the Plugins directory; on macOS/APFS (CrossOver/Wine),
+# SKSE enumerates *.dll in the Plugins directory. On macOS/APFS (CrossOver/Wine),
 # readdir() returns entries sorted by name. By sorting first alphabetically,
-# our kDataLoaded handler registers first and fires first, ensuring the Wine
+# our kDataLoaded handler registers first and fires first, so the Wine
 # editor ID cache fix runs before other plugins try LookupByEditorID.
 set_target_properties(
     ${PROJECT_NAME}
@@ -213,14 +213,21 @@ if(MSVC)
         /wd4200 # nonstandard extension used : zero-sized array in struct/union
 
         "$<$<CONFIG:DEBUG>:>"
-        "$<$<CONFIG:RELEASE>:/Zc:inline;/JMC-;/Ob3>"
+        "$<$<CONFIG:RELEASE>:/Zc:inline>"
+        "$<$<CONFIG:RELEASE>:/JMC->"
+        "$<$<CONFIG:RELEASE>:/Ob3>"
     )
 
     target_link_options(
         ${PROJECT_NAME}
         PRIVATE
-        "$<$<CONFIG:DEBUG>:/INCREMENTAL;/OPT:NOREF;/OPT:NOICF>"
-        "$<$<CONFIG:RELEASE>:/INCREMENTAL:NO;/OPT:REF;/OPT:ICF;/DEBUG:FULL>"
+        "$<$<CONFIG:DEBUG>:/INCREMENTAL>"
+        "$<$<CONFIG:DEBUG>:/OPT:NOREF>"
+        "$<$<CONFIG:DEBUG>:/OPT:NOICF>"
+        "$<$<CONFIG:RELEASE>:/INCREMENTAL:NO>"
+        "$<$<CONFIG:RELEASE>:/OPT:REF>"
+        "$<$<CONFIG:RELEASE>:/OPT:ICF>"
+        "$<$<CONFIG:RELEASE>:/DEBUG:FULL>"
     )
 endif()
 

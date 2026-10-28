@@ -464,6 +464,341 @@ namespace Patches::FormCaching
                     initCount, faultedForms.size(), totalMs);
 
                 // ==========================================================
+                // v1.23.0: Deferred ExtraData pointer fixup (replay sweep)
+                //
+                // The engine's normal load path writes raw file-local form
+                // IDs into 64-bit pointer fields during record load, then a
+                // post-load pass rebases each through the owner file's
+                // master table and stores the resolved TESForm*. Our
+                // ForceLoadAllForms path bypasses that pass entirely, so
+                // ExtraDataList pointer slots can still hold raw IDs until
+                // first use. Observed: Wispmother ACHR (ksws07_quest.esm)
+                // XLKR entry kept raw 0x0500152A — a file-local REFR ID —
+                // which propagated through AI travel/visit evaluation; a
+                // later free(0x1A0000) then faulted inside HookedDeallocate.
+                //
+                // This sweep replays the resolution pass for every
+                // REFR/ACHR: walk its extraData chain, and for each known
+                // pointer-bearing ExtraData type, rewrite any field still
+                // holding a raw file-local ID (0x100..0xFF000000) to the
+                // resolved form pointer. Entries that fail to resolve are
+                // left untouched for the VEH heuristics.
+                // ==========================================================
+                {
+                    auto& compFiles = tdh->compiledFileCollection.files;
+                    auto& compSmall = tdh->compiledFileCollection.smallFiles;
+
+                    auto ownerFileOf = [&](RE::FormID rt) -> RE::TESFile* {
+                        if ((rt & 0xFF000000) == 0xFE000000) {
+                            auto idx = (rt >> 12) & 0xFFF;
+                            return idx < compSmall.size() ? compSmall[idx] : nullptr;
+                        }
+                        auto idx = (rt >> 24) & 0xFF;
+                        return idx < compFiles.size() ? compFiles[idx] : nullptr;
+                    };
+
+                    auto rebaseLocalId = [&](RE::TESFile* owner, std::uint32_t raw) -> RE::FormID {
+                        auto hi = raw >> 24;
+                        auto* target = hi < owner->masterCount ? owner->masterPtrs[hi] : owner;
+                        if (!target) return 0;
+                        if (target->IsLight())
+                            return 0xFE000000 |
+                                (static_cast<RE::FormID>(target->smallFileCompileIndex) << 12) |
+                                (raw & 0xFFF);
+                        return (static_cast<RE::FormID>(target->compileIndex) << 24) |
+                            (raw & 0xFFFFFF);
+                    };
+
+                    std::uint64_t sweepRefs = 0, sweepNodes = 0, sweepSeen = 0,
+                                  sweepFixed = 0, sweepMissed = 0;
+
+                    auto fixSlot = [&](std::uint64_t* slot, RE::TESFile* owner) {
+                        auto val = *slot;
+                        if (val < 0x100 || val >= 0xFF000000ULL) return;
+                        ++sweepSeen;
+                        auto raw = static_cast<std::uint32_t>(val);
+                        auto rt = rebaseLocalId(owner, raw);
+                        auto* resolved = rt ? RE::TESForm::LookupByID(rt) : nullptr;
+                        if (resolved) {
+                            *slot = reinterpret_cast<std::uint64_t>(resolved);
+                            if (++sweepFixed <= 40) {
+                                logger::info("    XFIX raw 0x{:08X} -> rt 0x{:08X} -> 0x{:X} (type {})",
+                                    raw, rt, reinterpret_cast<std::uintptr_t>(resolved),
+                                    static_cast<std::uint8_t>(resolved->GetFormType()));
+                            }
+                        } else {
+                            if (++sweepMissed <= 40) {
+                                logger::warn("    XFIX miss raw 0x{:08X} rt 0x{:08X}", raw, rt);
+                            }
+                        }
+                    };
+
+                    // BSTArray<T>-based containers: _data@+0x00,
+                    // _capacity@+0x08, _size@+0x10. Elements of `stride`
+                    // bytes; the form pointer sits at `memberOff` in each.
+                    auto fixPtrArray = [&](std::uint8_t* arrBase, RE::TESFile* owner,
+                                           std::size_t stride, std::uint32_t memberOff) {
+                        if (!IsReadableMemory(arrBase, 0x18)) return;
+                        auto size = *reinterpret_cast<std::uint32_t*>(arrBase + 0x10);
+                        if (!size || size > 0x10000) return;
+                        auto data = *reinterpret_cast<std::uintptr_t*>(arrBase);
+                        if (!data) return;
+                        for (std::uint32_t i = 0; i < size; ++i) {
+                            auto* elem = reinterpret_cast<std::uint8_t*>(data) + i * stride;
+                            if (!IsReadableMemory(elem, stride)) return;
+                            fixSlot(reinterpret_cast<std::uint64_t*>(elem + memberOff), owner);
+                        }
+                    };
+
+                    enum : std::uint8_t {
+                        kFxSlots = 0, kFxLinkedRef, kFxPtrArray, kFxRefList,
+                        kFxRunOnce, kFxLock, kFxAliasArray, kFxFactionChanges,
+                        kFxMissingLinked,
+                    };
+                    struct FxTarget {
+                        std::uintptr_t vtable;
+                        std::uint8_t   kind;
+                        std::uint8_t   typeBit;   // ExtraDataType value = presence bit index
+                        std::uint8_t   off0;      // kFxSlots: first slot; container kinds: member offset
+                        std::uint8_t   off1;      // kFxSlots: optional second slot (0 = none)
+                    };
+                    // Non-static: v1.22.99 fixed a magic-static deadlock;
+                    // stack-init each call is 26 REL lookups, runs once per load.
+                    const FxTarget fxTargets[] = {
+                        { RE::VTABLE_ExtraAction[0].address(),               kFxSlots,          0x0D, 0x18, 0x00 },
+                        { RE::VTABLE_ExtraStartingPosition[0].address(),     kFxSlots,          0x0E, 0x28, 0x00 },
+                        { RE::VTABLE_ExtraPackageStartLocation[0].address(), kFxSlots,          0x18, 0x10, 0x00 },
+                        { RE::VTABLE_ExtraPackage[0].address(),              kFxSlots,          0x19, 0x10, 0x00 },
+                        { RE::VTABLE_ExtraRunOncePacks[0].address(),         kFxRunOnce,        0x1B, 0x10, 0x00 },
+                        { RE::VTABLE_ExtraOwnership[0].address(),            kFxSlots,          0x21, 0x10, 0x00 },
+                        { RE::VTABLE_ExtraGlobal[0].address(),               kFxSlots,          0x22, 0x10, 0x00 },
+                        { RE::VTABLE_ExtraLock[0].address(),                 kFxLock,           0x2A, 0x10, 0x00 },
+                        { RE::VTABLE_ExtraMissingLinkedRefIDs[0].address(),  kFxMissingLinked,  0x30, 0x10, 0x00 },
+                        { RE::VTABLE_ExtraRandomTeleportMarker[0].address(), kFxSlots,          0x3A, 0x10, 0x00 },
+                        { RE::VTABLE_ExtraStartingWorldOrCell[0].address(),  kFxSlots,          0x48, 0x10, 0x00 },
+                        { RE::VTABLE_ExtraLinkedRef[0].address(),            kFxLinkedRef,      0x50, 0x10, 0x00 },
+                        { RE::VTABLE_ExtraModelSwap[0].address(),            kFxSlots,          0x58, 0x10, 0x18 },
+                        { RE::VTABLE_ExtraFactionChanges[0].address(),       kFxFactionChanges, 0x5B, 0x10, 0x28 },
+                        { RE::VTABLE_ExtraDismemberedLimbs[0].address(),     kFxSlots,          0x5C, 0x18, 0x00 },
+                        { RE::VTABLE_ExtraMultiBoundRef[0].address(),        kFxSlots,          0x60, 0x10, 0x00 },
+                        { RE::VTABLE_ExtraEmittanceSource[0].address(),      kFxSlots,          0x63, 0x10, 0x00 },
+                        { RE::VTABLE_ExtraWaterLightRefs[0].address(),       kFxRefList,        0x80, 0x10, 0x00 },
+                        { RE::VTABLE_ExtraLitWaterRefs[0].address(),         kFxRefList,        0x81, 0x10, 0x00 },
+                        { RE::VTABLE_ExtraAliasInstanceArray[0].address(),   kFxAliasArray,     0x88, 0x10, 0x00 },
+                        { RE::VTABLE_ExtraLocation[0].address(),             kFxSlots,          0x89, 0x10, 0x00 },
+                        { RE::VTABLE_ExtraPromotedRef[0].address(),          kFxPtrArray,       0x8C, 0x10, 0x00 },
+                        { RE::VTABLE_ExtraFromAlias[0].address(),            kFxSlots,          0x95, 0x10, 0x00 },
+                        { RE::VTABLE_ExtraTextDisplayData[0].address(),      kFxSlots,          0x99, 0x18, 0x20 },
+                        { RE::VTABLE_ExtraLockList[0].address(),             kFxSlots,          0xA3, 0x10, 0x00 },
+                        { RE::VTABLE_ExtraLargeRefOwnerCells[0].address(),   kFxPtrArray,       0xA5, 0x10, 0x00 },
+                    };
+
+                    // Presence-bitfield mask: a ref whose presence map has no
+                    // pointer-bearing type set can skip the chain walk.
+                    std::uint8_t fxMask[0x18] = {};
+                    for (const auto& t : fxTargets)
+                        fxMask[t.typeBit >> 3] |= static_cast<std::uint8_t>(1u << (t.typeBit & 7));
+
+                    logger::info("=== ExtraData pointer fixup sweep (v1.23.0) ==="sv);
+                    auto sweepStart = std::chrono::high_resolution_clock::now();
+
+                    if (formMap) {
+                        auto* mapRaw = reinterpret_cast<const std::uint8_t*>(formMap);
+                        auto mapCapacity = *reinterpret_cast<const std::uint32_t*>(mapRaw + 0x0C);
+                        auto mapSentinel = *reinterpret_cast<const std::uintptr_t*>(mapRaw + 0x18);
+                        auto mapEntries = *reinterpret_cast<const std::uintptr_t*>(mapRaw + 0x28);
+                        if (!(mapCapacity > 0 && mapCapacity <= 0x1000000 && mapEntries >= 0x10000)) {
+                            logger::error("  ExtraData fixup: hash table layout invalid — skipping");
+                            mapCapacity = 0;
+                        }
+                        auto* entryBase = reinterpret_cast<const std::uint8_t*>(mapEntries);
+
+                        for (std::uint32_t i = 0; i < mapCapacity; ++i) {
+                            auto* entry = entryBase + i * 24;
+
+                            if (i % 4096 == 0) {
+                                if (!IsReadableMemory(entry, static_cast<size_t>(
+                                    std::min(std::size_t((mapCapacity - i) * 24), std::size_t(4096 * 24)))))
+                                    break;
+                            }
+
+                            auto formPtr = *reinterpret_cast<const std::uintptr_t*>(entry + 8);
+                            if (formPtr == 0 || formPtr == mapSentinel ||
+                                formPtr < 0x10000 || formPtr > 0x7FFFFFFFFFFF)
+                            {
+                                continue;
+                            }
+
+                            auto* formObj = reinterpret_cast<const std::uint8_t*>(formPtr);
+                            if (!IsReadableMemory(formObj, 0x98)) {  // need through extraList@0x70+0x20
+                                continue;
+                            }
+                            auto vtable = *reinterpret_cast<const std::uintptr_t*>(formObj);
+                            if (vtable < imgBase || vtable >= imgEnd) {
+                                continue;
+                            }
+
+                            auto* form = reinterpret_cast<RE::TESForm*>(
+                                const_cast<std::uint8_t*>(formObj));
+                            auto ftype = form->GetFormType();
+                            if (ftype != RE::FormType::Reference &&
+                                ftype != RE::FormType::ActorCharacter)
+                            {
+                                continue;
+                            }
+                            ++sweepRefs;
+
+                            auto* owner = ownerFileOf(form->GetFormID());
+                            if (!owner) continue;
+
+                            auto* refrObj = const_cast<std::uint8_t*>(formObj);
+                            // BaseExtraList: vptr@0x70, data@0x78, presence@0x80
+                            auto presencePtr = *reinterpret_cast<std::uintptr_t*>(refrObj + 0x80);
+                            if (presencePtr &&
+                                IsReadableMemory(reinterpret_cast<void*>(presencePtr), 0x18)) {
+                                auto* bits = reinterpret_cast<const std::uint8_t*>(presencePtr);
+                                bool any = false;
+                                for (int b = 0; b < 0x18; ++b) {
+                                    if (bits[b] & fxMask[b]) { any = true; break; }
+                                }
+                                if (!any) continue;
+                            }
+
+                            auto node = *reinterpret_cast<std::uintptr_t*>(refrObj + 0x78);
+                            for (int n = 0; node && n < 64; ++n) {
+                                if (!IsReadableMemory(reinterpret_cast<void*>(node), 0x40)) break;
+                                auto nvt = *reinterpret_cast<const std::uintptr_t*>(node);
+                                ++sweepNodes;
+
+                                const FxTarget* target = nullptr;
+                                for (const auto& t : fxTargets) {
+                                    if (t.vtable == nvt) { target = &t; break; }
+                                }
+                                if (target) {
+                                    auto* nodeBase = reinterpret_cast<std::uint8_t*>(node);
+                                    switch (target->kind) {
+                                    case kFxSlots:
+                                        fixSlot(reinterpret_cast<std::uint64_t*>(nodeBase + target->off0), owner);
+                                        if (target->off1)
+                                            fixSlot(reinterpret_cast<std::uint64_t*>(nodeBase + target->off1), owner);
+                                        break;
+                                    case kFxLinkedRef: {
+                                        // BSTSmallArray<LinkedRef>@0x10:
+                                        // cap|local bitfield@+0x10, union
+                                        // {heap ptr | local[0x10]}@+0x18,
+                                        // _size@+0x28. Entries stride 0x10:
+                                        // {BGSKeyword* kw@0, TESObjectREFR* r@8}.
+                                        auto* arr = nodeBase + target->off0;
+                                        auto capLocal = *reinterpret_cast<std::uint32_t*>(arr);
+                                        auto size = *reinterpret_cast<std::uint32_t*>(arr + 0x18);
+                                        std::uintptr_t data = (capLocal >> 31)
+                                            ? reinterpret_cast<std::uintptr_t>(arr + 0x08)
+                                            : *reinterpret_cast<std::uintptr_t*>(arr + 0x08);
+                                        if (size > 0x1000) break;
+                                        for (std::uint32_t j = 0; j < size; ++j) {
+                                            auto* elem = reinterpret_cast<std::uint8_t*>(data) + j * 0x10;
+                                            if (!IsReadableMemory(elem, 0x10)) break;
+                                            fixSlot(reinterpret_cast<std::uint64_t*>(elem + 0x00), owner);
+                                            fixSlot(reinterpret_cast<std::uint64_t*>(elem + 0x08), owner);
+                                        }
+                                        break;
+                                    }
+                                    case kFxPtrArray:
+                                        // BSTArray<TESForm*> — elements are the pointers.
+                                        fixPtrArray(nodeBase + target->off0, owner, 8, 0);
+                                        break;
+                                    case kFxRefList: {
+                                        // BSSimpleList<TESObjectREFR*> inline
+                                        // head: {item@0, next@8}.
+                                        auto cur = reinterpret_cast<std::uintptr_t>(nodeBase + target->off0);
+                                        for (int k = 0; cur && k < 256; ++k) {
+                                            if (!IsReadableMemory(reinterpret_cast<void*>(cur), 0x10)) break;
+                                            fixSlot(reinterpret_cast<std::uint64_t*>(cur), owner);
+                                            cur = *reinterpret_cast<std::uintptr_t*>(cur + 8);
+                                        }
+                                        break;
+                                    }
+                                    case kFxRunOnce: {
+                                        // packages@0x10 is BSSimpleList<RunOncePackage*>*;
+                                        // RunOncePackage{TESPackage* pkg@0}.
+                                        auto listPtr = *reinterpret_cast<std::uintptr_t*>(nodeBase + target->off0);
+                                        for (int k = 0; listPtr && k < 64; ++k) {
+                                            if (!IsReadableMemory(reinterpret_cast<void*>(listPtr), 0x10)) break;
+                                            auto pkg = *reinterpret_cast<std::uintptr_t*>(listPtr);
+                                            if (pkg && IsReadableMemory(reinterpret_cast<void*>(pkg), 8))
+                                                fixSlot(reinterpret_cast<std::uint64_t*>(pkg), owner);
+                                            listPtr = *reinterpret_cast<std::uintptr_t*>(listPtr + 8);
+                                        }
+                                        break;
+                                    }
+                                    case kFxLock: {
+                                        // lock@0x10 -> REFR_LOCK{TESKey* key@0x08}.
+                                        auto lock = *reinterpret_cast<std::uintptr_t*>(nodeBase + target->off0);
+                                        if (lock && IsReadableMemory(reinterpret_cast<void*>(lock), 0x10))
+                                            fixSlot(reinterpret_cast<std::uint64_t*>(lock + 0x08), owner);
+                                        break;
+                                    }
+                                    case kFxAliasArray: {
+                                        // BSTArray<BGSRefAliasInstanceData*>:
+                                        // each elem -> {quest@0, alias@8,
+                                        // const BSTArray<TESPackage*>*@0x10}.
+                                        auto* arr = nodeBase + target->off0;
+                                        auto size = *reinterpret_cast<std::uint32_t*>(arr + 0x10);
+                                        if (!size || size > 0x10000) break;
+                                        auto data = *reinterpret_cast<std::uintptr_t*>(arr);
+                                        if (!data) break;
+                                        for (std::uint32_t j = 0; j < size; ++j) {
+                                            auto elem = *reinterpret_cast<std::uintptr_t*>(
+                                                reinterpret_cast<std::uint8_t*>(data) + j * 8);
+                                            if (!elem || !IsReadableMemory(reinterpret_cast<void*>(elem), 0x18))
+                                                continue;
+                                            fixSlot(reinterpret_cast<std::uint64_t*>(elem), owner);
+                                            auto pkgs = *reinterpret_cast<std::uintptr_t*>(elem + 0x10);
+                                            if (pkgs && IsReadableMemory(reinterpret_cast<void*>(pkgs), 0x18))
+                                                fixPtrArray(reinterpret_cast<std::uint8_t*>(pkgs), owner, 8, 0);
+                                        }
+                                        break;
+                                    }
+                                    case kFxFactionChanges:
+                                        // BSTArray<FACTION_RANK>@0x10 +
+                                        // crimeFaction@0x28.
+                                        fixPtrArray(nodeBase + target->off0, owner, 0x10, 0);
+                                        fixSlot(reinterpret_cast<std::uint64_t*>(nodeBase + target->off1), owner);
+                                        break;
+                                    case kFxMissingLinked: {
+                                        // Array@0x10: union {entry[1]|ptr}@+0x00,
+                                        // _size@+0x10. Entry{keyword*@0, id@8} —
+                                        // fix the keyword pointer; linkedRefID
+                                        // stays a FormID by design.
+                                        auto* arr = nodeBase + target->off0;
+                                        auto size = *reinterpret_cast<std::uint32_t*>(arr + 0x10);
+                                        if (!size || size > 0x1000) break;
+                                        std::uintptr_t data = size == 1
+                                            ? reinterpret_cast<std::uintptr_t>(arr)
+                                            : *reinterpret_cast<std::uintptr_t*>(arr);
+                                        for (std::uint32_t j = 0; j < size; ++j) {
+                                            auto* elem = reinterpret_cast<std::uint8_t*>(data) + j * 0x10;
+                                            if (!IsReadableMemory(elem, 0x10)) break;
+                                            fixSlot(reinterpret_cast<std::uint64_t*>(elem), owner);
+                                        }
+                                        break;
+                                    }
+                                    }
+                                }
+
+                                node = *reinterpret_cast<std::uintptr_t*>(node + 0x08);
+                            }
+                        }
+                    }
+
+                    auto sweepMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::high_resolution_clock::now() - sweepStart).count();
+                    logger::info("  ExtraData fixup: {} refs, {} nodes, {} raw slots seen, "
+                        "{} fixed, {} unresolved, {}ms",
+                        sweepRefs, sweepNodes, sweepSeen, sweepFixed, sweepMissed, sweepMs);
+                }
+
+                // ==========================================================
                 // v1.22.36: Mark permanently faulted forms as kDeleted.
                 //
                 // The 179 faulted ActorCharacter forms have null internal
