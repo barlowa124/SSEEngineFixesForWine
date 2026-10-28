@@ -160,16 +160,16 @@ namespace Patches::FormCaching
                 }
             }
 
-            // v1.22.86: After kDataLoaded, the cache is authoritative.
-            // All ESM forms were cached during loading (AddFormToDataHandler).
-            // New forms from New Game come through SetAt hooks.
-            // NEVER fall through to native BSTHashMap::find — its bucket chains
-            // are corrupted by grow/rehash races under Wine (freed bucket arrays
-            // get reused for string allocations → ASCII data read as pointers →
-            // infinite loop in unpatched find sites → freeze).
-            if (g_cacheAuthoritative.load(std::memory_order_acquire)) {
-                return nullptr;
-            }
+            // v1.23.1: Authoritative early-return removed (deployed-binary
+            // parity — the je→jmp patch at the same site proved this all
+            // session). ~166 forms created before SKSE attach never enter
+            // g_formCache; returning nullptr here made CIF's reserved-form
+            // lookup fail. Misses now fall through to native
+            // GetFormByNumericId, which also warms the shard. The grow/
+            // rehash corruption that motivated v1.22.86 is separately
+            // fixed by the dealloc-NOP + sentinel hooks, and the
+            // g_cacheAuthoritative flag stays set for the watchdog's
+            // zero-delta freeze detector.
 
             // v1.22.84: Lazily capture the form map inner pointer so SetAt
             // cache-update can identify calls targeting the global form map.

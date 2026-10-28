@@ -877,19 +877,18 @@ namespace Patches::FormCaching
                         }
                     }
                 } else {
-                    // High-invalid: find register with invalid high bits
-                    // that when offset-adjusted matches targetAddr
+                    // High-invalid: the first register above the user-mode
+                    // bound is the culprit — no proximity check against
+                    // targetAddr (the deployed binary's jmp patch proved
+                    // the ±64KB window misses real faults under Wine's
+                    // flat addressing).
                     for (int i = 0; i < 15; ++i) {
                         DWORD64 val = *gprs[i];
                         if (val <= 0x00007FFFFFFFFFFFULL)
                             continue; // Valid user-mode address, skip
-                        auto diff = static_cast<std::int64_t>(targetAddr) -
-                                    static_cast<std::int64_t>(val);
-                        if (diff >= -0x10000 && diff <= 0x10000) {
-                            *gprs[i] = zp; // Replace with zero page base
-                            patched = true;
-                            break;
-                        }
+                        *gprs[i] = zp; // Replace with zero page base
+                        patched = true;
+                        break;
                     }
                 }
 

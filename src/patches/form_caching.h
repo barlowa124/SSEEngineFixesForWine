@@ -120,22 +120,20 @@ namespace Patches::FormCaching
 
             // Zero the static object (0x80000 bytes at +0x31D7DD0) — replicates
             // what the init path does, ensuring the shard array is clean.
+            // v1.23.1: The memset and guard write are omitted — under Wine they
+            // faulted even after VirtualProtect succeeded, and the deployed
+            // binary NOP'd both. The object is .bss (already zero-filled by the
+            // loader) and the NOP'd jg makes the guard state irrelevant.
             auto* staticObj = reinterpret_cast<std::uint8_t*>(imgBase + 0x31D7DD0);
             DWORD oldProt2 = 0;
             if (VirtualProtect(staticObj, 0x80000, PAGE_READWRITE, &oldProt2)) {
-                memset(staticObj, 0, 0x80000);
-                logger::info("v1.22.98: Zeroed static shard array at +0x31D7DD0 (512KB)");
+                logger::info("v1.22.98: Static shard array at +0x31D7DD0 left as loader-zeroed .bss (512KB)");
             }
 
-            // Clear the guard variable (+0x3257ED8) — if a previous session left
-            // it at -1, the NOP'd jg already bypasses it, but clear it anyway so
-            // any other code checking the guard sees a clean state.
             auto* guard = reinterpret_cast<std::int32_t*>(imgBase + 0x3257ED8);
             DWORD oldProt3 = 0;
             if (VirtualProtect(guard, 4, PAGE_READWRITE, &oldProt3)) {
-                // Set to 1 (positive = initialized) rather than 0 (= uninit)
-                *guard = 1;
-                logger::info("v1.22.98: Set magic-static guard at +0x3257ED8 to 1 (initialized)");
+                logger::info("v1.22.98: Magic-static guard at +0x3257ED8 untouched — jg bypass covers it");
             }
         }
 
